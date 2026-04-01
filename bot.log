@@ -748,3 +748,7 @@
 2026-03-31 13:11:19 [INFO] market_discovery — Scan complete — 0 opportunities found
 2026-03-31 13:11:19 [INFO] bot — Sleeping 60s until next scan…
 2026-03-31 13:11:19 [INFO] bot — Main loop exited
+2026-04-01 16:50:27 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Kalshi-Quant-TeleBot/kalshi_private_key.pem
+2026-04-01 16:52:09 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Kalshi-Quant-TeleBot/kalshi_private_key.pem
+2026-04-01 16:53:55 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Downloads/SafeKalshi (1).txt
+2026-04-01 16:56:36 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Downloads/SafeKalshi (1).txt

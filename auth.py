@@ -1,7 +1,7 @@
 """
 Kalshi RSA authentication.
 
-Kalshi v2 API uses PKCS1v15 + SHA-256 signing.
+Kalshi v2 API uses RSA-PSS + SHA-256 signing.
 Each authenticated request must include three headers:
     KALSHI-ACCESS-KEY       — your API key ID
     KALSHI-ACCESS-TIMESTAMP — current Unix time as a string (milliseconds)
@@ -95,7 +95,10 @@ def get_auth_headers(method: str, path: str) -> Dict[str, str]:
 
     signature_bytes = private_key.sign(
         message_bytes,
-        padding.PKCS1v15(),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH,
+        ),
         hashes.SHA256(),
     )
 
