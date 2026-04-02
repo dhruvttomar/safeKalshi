@@ -28,6 +28,7 @@ Risk env overrides (all optional):
     NUM_CONTRACTS        default 1     contracts per bet
 """
 
+import collections
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from flask import Flask, jsonify
 
 import config
 import utils
@@ -62,6 +64,7 @@ MAX_YES_ASK           = 0.98    # don't buy if market is already at 98 c — no 
 MIN_LIQUIDITY         = 3       # minimum contracts available on the ask side
 
 STATE_FILE            = Path("blowout_state.json")
+DASHBOARD_PORT        = int(os.getenv("DASHBOARD_PORT", "5001"))
 
 TELEGRAM_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -76,6 +79,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("blowout")
+
+# In-memory ring buffer — dashboard reads from this
+_log_buffer: collections.deque = collections.deque(maxlen=200)
+
+class _BufHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        _log_buffer.appendleft(self.format(record))
+
+_bh = _BufHandler()
+_bh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger().addHandler(_bh)
+
+_start_time = time.time()
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -364,16 +380,25 @@ def _tg_command_loop(state: AppState) -> None:
                         send_telegram(_fmt_status(state))
                     elif text.startswith("/orders"):
                         send_telegram(_fmt_orders(state))
+                    elif text.startswith("/log"):
+                        # /log or /log 20 (optional line count)
+                        parts = text.split()
+                        try:
+                            n = max(1, min(int(parts[1]), 50)) if len(parts) > 1 else 20
+                        except ValueError:
+                            n = 20
+                        send_telegram(_fmt_log(n))
                     elif text.startswith("/stop"):
                         send_telegram("Stop command received — shutting down...")
                         _shutdown_event.set()
                     elif text.startswith("/help"):
                         send_telegram(
                             "Commands:\n"
-                            "/status — daily stats and exposure\n"
-                            "/orders — list open (unfilled) orders\n"
-                            "/stop   — graceful shutdown\n"
-                            "/help   — this message"
+                            "/status      — daily stats and exposure\n"
+                            "/orders      — list open (unfilled) orders\n"
+                            "/log [N]     — last N log lines (default 20, max 50)\n"
+                            "/stop        — graceful shutdown\n"
+                            "/help        — this message"
                         )
         except Exception:
             pass
@@ -390,6 +415,13 @@ def _fmt_status(state: AppState) -> str:
         f"Games tracked: {len(state.already_traded)}\n"
         f"Open orders:   {len(state.open_orders)}"
     )
+
+
+def _fmt_log(n: int = 20) -> str:
+    lines = list(_log_buffer)[:n]
+    if not lines:
+        return "No log lines yet."
+    return "[LOG]\n" + "\n".join(lines)
 
 
 def _fmt_orders(state: AppState) -> str:
@@ -651,11 +683,116 @@ def _handle_shutdown(state: AppState, *_) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Web dashboard
+# ---------------------------------------------------------------------------
+
+_app_state_ref: Optional[AppState] = None
+_dash = Flask(__name__)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Blowout Monitor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:'SF Mono','Fira Code',monospace;font-size:13px;padding:20px}
+h1{color:#58a6ff;font-size:20px;font-weight:700}
+.sub{color:#8b949e;font-size:12px;margin-top:2px;margin-bottom:14px}
+.badges{display:flex;gap:8px;margin-bottom:16px}
+.badge{padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700}
+.prod{background:#da3633;color:#fff}.demo{background:#1f3a6e;color:#58a6ff;border:1px solid #388bfd}
+.live{background:#1a4731;color:#3fb950;border:1px solid #238636}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px}
+.card-label{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.card-value{font-size:24px;font-weight:700;color:#e6edf3}
+.card-sub{font-size:11px;color:#8b949e;margin-top:3px}
+.bar-bg{background:#21262d;border-radius:3px;height:3px;margin-top:8px}
+.bar{border-radius:3px;height:3px;transition:width .4s}
+.ok{background:#3fb950}.warn{background:#e3b341}.danger{background:#f85149}
+.box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px;margin-bottom:12px}
+.box-title{color:#58a6ff;font-size:11px;text-transform:uppercase;font-weight:700;margin-bottom:10px}
+table{width:100%;border-collapse:collapse}
+th{color:#8b949e;text-align:left;padding:4px 8px;font-size:11px;border-bottom:1px solid #30363d;font-weight:400}
+td{padding:5px 8px;border-bottom:1px solid #21262d;font-size:12px}
+.log{background:#010409;border:1px solid #21262d;border-radius:4px;padding:10px;height:340px;overflow-y:auto}
+.ll{white-space:pre-wrap;line-height:1.7;font-size:12px}
+.INFO{color:#c9d1d9}.WARN{color:#e3b341}.ERROR{color:#f85149}.DEBUG{color:#484f58}
+.empty{color:#484f58;font-style:italic}
+.footer{color:#484f58;font-size:11px;margin-top:10px}
+</style></head>
+<body>
+<h1>Blowout Monitor</h1>
+<div class="sub" id="sub">Loading\u2026</div>
+<div class="badges" id="badges"></div>
+<div class="grid" id="stats"></div>
+<div class="box"><div class="box-title">Open Orders</div><div id="orders"></div></div>
+<div class="box"><div class="box-title">Recent Logs</div><div class="log" id="logs"></div></div>
+<div class="footer" id="footer"></div>
+<script>
+function fmt(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;return h?h+'h '+m+'m':m?m+'m '+r+'s':r+'s'}
+function bar(v,mx){var p=Math.min(100,v/mx*100),c=p>90?'danger':p>70?'warn':'ok';return'<div class="bar-bg"><div class="bar '+c+'" style="width:'+p.toFixed(1)+'%"></div></div>'}
+async function refresh(){
+  try{
+    var d=await(await fetch('/api/state')).json(),lim=d.limits,now=Date.now()/1000;
+    document.getElementById('sub').textContent=d.date+' \u2022 Uptime: '+fmt(d.uptime_sec);
+    document.getElementById('badges').innerHTML='<span class="badge live">\u25cf LIVE</span>'
+      +'<span class="badge '+(d.env==='PRODUCTION'?'prod':'demo')+'">'+d.env+'</span>';
+    document.getElementById('stats').innerHTML=
+      card('Daily Spend','$'+d.daily_spend.toFixed(2),'limit $'+lim.max_daily_spend.toFixed(0),bar(d.daily_spend,lim.max_daily_spend))+
+      card('Open Exposure','$'+d.total_exposure.toFixed(2),'limit $'+lim.max_total_exposure.toFixed(0),bar(d.total_exposure,lim.max_total_exposure))+
+      card('Bets Placed',d.bets_placed,d.bets_filled+' confirmed filled','')+
+      card('Games Tracked',d.already_traded.length,d.open_orders.length+' open orders','');
+    document.getElementById('orders').innerHTML=d.open_orders.length?
+      '<table><thead><tr><th>Ticker</th><th>Price \u00d7 Qty</th><th>Cost</th><th>Age</th></tr></thead><tbody>'+
+      d.open_orders.map(function(o){var age=fmt(now-o.submitted_at);return'<tr><td>'+o.ticker+'</td><td>$'+o.price.toFixed(2)+' \u00d7 '+o.contracts+'</td><td>$'+(o.price*o.contracts).toFixed(2)+'</td><td>'+age+' old</td></tr>'}).join('')+
+      '</tbody></table>':'<span class="empty">No open orders</span>';
+    document.getElementById('logs').innerHTML=d.logs.length?d.logs.map(function(l){
+      var lv=(l.match(/\\[(INFO|WARNING|ERROR|DEBUG)\\]/)||['','INFO'])[1],c=lv==='WARNING'?'WARN':lv;
+      return'<div class="ll '+c+'">'+l.replace(/</g,'&lt;')+'</div>'}).join(''):'<span class="empty">No log lines yet</span>';
+    document.getElementById('footer').textContent='Updated '+new Date().toLocaleTimeString();
+  }catch(e){document.getElementById('footer').textContent='Connection lost \u2014 '+new Date().toLocaleTimeString()}
+}
+function card(label,val,sub,extra){return'<div class="card"><div class="card-label">'+label+'</div><div class="card-value">'+val+'</div><div class="card-sub">'+sub+'</div>'+extra+'</div>'}
+setInterval(refresh,3000);refresh();
+</script></body></html>"""
+
+
+@_dash.route("/")
+def _dash_index():
+    return _DASHBOARD_HTML
+
+
+@_dash.route("/api/state")
+def _dash_api():
+    with _state_lock:
+        if _app_state_ref is None:
+            return jsonify({"error": "bot not started"})
+        data = asdict(_app_state_ref)
+    data["logs"]       = list(_log_buffer)
+    data["uptime_sec"] = int(time.time() - _start_time)
+    data["env"]        = "DEMO" if "demo" in config.KALSHI_API_BASE.lower() else "PRODUCTION"
+    data["limits"]     = {
+        "max_daily_spend":    MAX_DAILY_SPEND,
+        "max_total_exposure": MAX_TOTAL_EXPOSURE,
+        "num_contracts":      NUM_CONTRACTS,
+    }
+    return jsonify(data)
+
+
+def _start_dashboard() -> None:
+    _dash.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False, use_reloader=False)
+
+
+# ---------------------------------------------------------------------------
 # Main monitor loop
 # ---------------------------------------------------------------------------
 
 def monitor() -> None:
+    global _app_state_ref
     state = load_state()
+    _app_state_ref = state
 
     signal.signal(signal.SIGINT,  lambda s, f: _handle_shutdown(state, s, f))
     signal.signal(signal.SIGTERM, lambda s, f: _handle_shutdown(state, s, f))
@@ -665,6 +802,10 @@ def monitor() -> None:
         target=_tg_command_loop, args=(state,), daemon=True, name="tg-cmd"
     )
     tg_thread.start()
+
+    # Start web dashboard in background
+    dash_thread = threading.Thread(target=_start_dashboard, daemon=True, name="dashboard")
+    dash_thread.start()
 
     is_demo = "demo" in config.KALSHI_API_BASE.lower()
 
@@ -677,6 +818,7 @@ def monitor() -> None:
     log.info("Contracts/bet: %d", NUM_CONTRACTS)
     log.info("State file   : %s", STATE_FILE.resolve())
     log.info("Telegram     : %s", "configured" if TELEGRAM_TOKEN else "not configured")
+    log.info("Dashboard    : http://127.0.0.1:%d", DASHBOARD_PORT)
     log.info("=" * 60)
 
     send_telegram(
