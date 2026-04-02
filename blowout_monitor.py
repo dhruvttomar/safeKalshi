@@ -57,7 +57,7 @@ BET_AMOUNT            = float(os.getenv("BET_AMOUNT",          "1000"))
 NUM_CONTRACTS         = int(os.getenv("NUM_CONTRACTS",         "1"))  # unused when BET_AMOUNT set
 
 BLOWOUT_DIFF          = 22      # minimum point differential
-BLOWOUT_TIME_SEC      = 960     # 16 min = 960 s remaining in regulation
+BLOWOUT_TIME_SEC      = 1260    # 21 min = 1260 s remaining in regulation
 POLL_INTERVAL_SEC     = 30      # normal poll cadence
 POLL_INTERVAL_FINAL   = 10      # poll cadence when any game is in its last period
 STALE_ORDER_SEC       = 300     # cancel unfilled orders after 5 min
@@ -365,7 +365,7 @@ def _tg_command_loop(state: AppState) -> None:
     if not TELEGRAM_TOKEN:
         return
 
-    while not _shutdown_event.is_set():
+    while True:
         try:
             r = _tg_session.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
@@ -832,7 +832,7 @@ def monitor() -> None:
         f"Send /help for commands"
     )
 
-    while not _shutdown_event.is_set():
+    while True:
         with _state_lock:
             maybe_reset_daily(state)
 
@@ -861,7 +861,7 @@ def monitor() -> None:
             # Check if daily spend limit is hit — no point scanning
             if state.daily_spend >= MAX_DAILY_SPEND:
                 log.warning("Daily spend limit reached ($%.2f) — no new bets today", state.daily_spend)
-                _shutdown_event.wait(POLL_INTERVAL_SEC)
+                time.sleep(POLL_INTERVAL_SEC)
                 continue
 
             # ── Scan ESPN ──
@@ -925,7 +925,7 @@ def monitor() -> None:
 
         interval = POLL_INTERVAL_FINAL if in_final else POLL_INTERVAL_SEC
         log.info("Sleeping %ds…", interval)
-        _shutdown_event.wait(interval)   # interruptible sleep — exits immediately on /stop
+        time.sleep(interval)
 
     log.info("Monitor loop exited cleanly")
 
