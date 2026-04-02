@@ -51,9 +51,10 @@ import utils
 # Configuration — all tunable via env vars
 # ---------------------------------------------------------------------------
 
-MAX_DAILY_SPEND       = float(os.getenv("MAX_DAILY_SPEND",     "50"))
-MAX_TOTAL_EXPOSURE    = float(os.getenv("MAX_TOTAL_EXPOSURE",  "100"))
-NUM_CONTRACTS         = int(os.getenv("NUM_CONTRACTS",         "1"))
+MAX_DAILY_SPEND       = float(os.getenv("MAX_DAILY_SPEND",     "100000"))
+MAX_TOTAL_EXPOSURE    = float(os.getenv("MAX_TOTAL_EXPOSURE",  "100000"))
+BET_AMOUNT            = float(os.getenv("BET_AMOUNT",          "1000"))
+NUM_CONTRACTS         = int(os.getenv("NUM_CONTRACTS",         "1"))  # unused when BET_AMOUNT set
 
 BLOWOUT_DIFF          = 22      # minimum point differential
 BLOWOUT_TIME_SEC      = 960     # 16 min = 960 s remaining in regulation
@@ -593,8 +594,10 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         log.info("SKIP %s: ask_size=%d < MIN_LIQUIDITY=%d", ticker, ask_size, MIN_LIQUIDITY)
         return False
 
+    num_contracts = max(1, int(BET_AMOUNT / ask))
+
     try:
-        check_risk(state, ask, NUM_CONTRACTS)
+        check_risk(state, ask, num_contracts)
     except RiskBlocked as exc:
         log.info("RISK BLOCK — %s", exc)
         send_telegram(f"Risk block: {exc}")
@@ -605,7 +608,7 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         "action":    "buy",
         "side":      "yes",
         "type":      "limit",
-        "count":     NUM_CONTRACTS,
+        "count":     num_contracts,
         "yes_price": utils.dollars_to_cents(ask),
     }
 
@@ -623,14 +626,14 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
 
     raw      = resp.get("order") or resp
     order_id = raw.get("order_id") or raw.get("id", "unknown")
-    cost     = ask * NUM_CONTRACTS
+    cost     = ask * num_contracts
 
     state.open_orders.append({
         "order_id":     order_id,
         "ticker":       ticker,
         "espn_id":      game.espn_id,
         "price":        ask,
-        "contracts":    NUM_CONTRACTS,
+        "contracts":    num_contracts,
         "submitted_at": time.time(),
     })
     state.daily_spend    += cost
@@ -644,7 +647,7 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         f"Leader: {game.leading_team} +{game.diff} pts | "
         f"{game.time_remaining_sec/60:.1f} min left\n"
         f"Ticker: {ticker}\n"
-        f"Ask: ${ask:.2f} x {NUM_CONTRACTS} contract(s)\n"
+        f"Ask: ${ask:.2f} x {num_contracts} contract(s) = ${cost:.2f}\n"
         f"Order ID: {order_id}\n"
         f"Daily spend: ${state.daily_spend:.2f} / ${MAX_DAILY_SPEND:.2f}"
     )
