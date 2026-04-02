@@ -752,3 +752,5 @@
 2026-04-01 16:52:09 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Kalshi-Quant-TeleBot/kalshi_private_key.pem
 2026-04-01 16:53:55 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Downloads/SafeKalshi (1).txt
 2026-04-01 16:56:36 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Downloads/SafeKalshi (1).txt
+2026-04-02 00:25:27 [INFO] auth — RSA private key loaded from /Users/dhruvtomar/Downloads/papertrade.txt
+2026-04-02 00:25:27 [INFO] auth — Auth config verified: key_id=2c540509-b700-4247-a611-2435250d2739, key_path=/Users/dhruvtomar/Downloads/papertrade.txt
