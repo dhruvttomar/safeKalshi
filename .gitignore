@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+blowout_state.json
+trade_log.json
+bot.log
