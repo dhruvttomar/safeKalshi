@@ -65,7 +65,11 @@ MAX_YES_ASK           = 0.98    # don't buy if market is already at 98 c — no 
 MIN_LIQUIDITY         = 3       # minimum contracts available on the ask side
 
 STATE_FILE            = Path("blowout_state.json")
+TRADE_LOG_FILE        = Path("trade_log.json")
 DASHBOARD_PORT        = int(os.getenv("DASHBOARD_PORT", "5001"))
+
+POLL_INTERVAL_NEAR    = 8       # poll cadence when any game is within 5 pts of blowout threshold
+NEAR_BLOWOUT_DIFF     = BLOWOUT_DIFF - 5   # 17 pts — start watching closely
 
 TELEGRAM_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -208,11 +212,83 @@ class AppState:
     bets_placed: int       = 0      # bets placed today
     bets_filled: int       = 0      # bets confirmed filled today
     already_traded: list   = field(default_factory=list)   # ESPN game IDs
+    blowout_notified: list = field(default_factory=list)   # ESPN game IDs that got a Telegram alert
     open_orders: list      = field(default_factory=list)
     # open_orders entries: {order_id, ticker, espn_id, price, contracts, submitted_at}
 
 
 _state_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Trade log — persisted record of every bet placed, filled, and resolved
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TradeRecord:
+    order_id:           str
+    ticker:             str
+    espn_id:            str
+    league:             str
+    away_team:          str
+    home_team:          str
+    leading_team:       str
+    diff:               int
+    period:             int
+    time_remaining_sec: float
+    entry_price:        float
+    contracts:          int
+    cost:               float
+    entry_ts:           float
+    # filled in by poll_orders
+    outcome:            str   = "pending"  # pending / filled / cancelled / expired
+    fill_price:         float = 0.0
+    fill_ts:            float = 0.0
+    # filled in by resolve_trades after market closes
+    market_result:      str   = ""         # "yes" / "no" / ""
+    pnl:                float = 0.0        # (1 - fill_price)*contracts if yes, else -fill_price*contracts
+
+
+_trade_log: list[TradeRecord] = []
+_trade_log_lock = threading.Lock()
+
+
+def load_trade_log() -> list[TradeRecord]:
+    if not TRADE_LOG_FILE.exists():
+        return []
+    try:
+        data = json.loads(TRADE_LOG_FILE.read_text())
+        return [
+            TradeRecord(**{k: v for k, v in r.items() if k in TradeRecord.__dataclass_fields__})
+            for r in data
+        ]
+    except Exception as exc:
+        log.warning("Could not load trade log (%s) — starting fresh", exc)
+        return []
+
+
+def _save_trade_log() -> None:
+    """Caller must hold _trade_log_lock."""
+    try:
+        TRADE_LOG_FILE.write_text(json.dumps([asdict(r) for r in _trade_log], indent=2))
+    except Exception as exc:
+        log.error("Failed to save trade log: %s", exc)
+
+
+def _record_trade(record: TradeRecord) -> None:
+    with _trade_log_lock:
+        _trade_log.append(record)
+        _save_trade_log()
+
+
+def _update_trade(order_id: str, **kwargs) -> None:
+    with _trade_log_lock:
+        for r in _trade_log:
+            if r.order_id == order_id:
+                for k, v in kwargs.items():
+                    setattr(r, k, v)
+                break
+        _save_trade_log()
 
 
 def load_state() -> AppState:
@@ -307,6 +383,7 @@ def poll_orders(state: AppState) -> None:
                 )
                 log.info(msg)
                 send_telegram(msg)
+                _update_trade(order_id, outcome="cancelled", fill_ts=now)
             except Exception as exc:
                 log.error("Could not cancel stale order %s: %s", order_id, exc)
                 still_open.append(o)
@@ -340,15 +417,52 @@ def poll_orders(state: AppState) -> None:
             )
             log.info(msg)
             send_telegram(msg)
+            _update_trade(order_id, outcome="filled", fill_price=avg_price, fill_ts=now)
 
         elif status in ("cancelled", "canceled", "expired"):
             state.total_exposure = max(0.0, state.total_exposure - cost)
             log.info("Order externally cancelled: %s", order_id)
+            _update_trade(order_id, outcome="cancelled", fill_ts=now)
 
         else:
             still_open.append(o)   # still resting on the book
 
     state.open_orders = still_open
+
+
+def resolve_trades() -> None:
+    """
+    For every filled trade with no market result yet, check whether the
+    Kalshi market has finalized.  Computes P&L and notifies Telegram.
+    Safe to call every poll cycle — resolved trades are skipped quickly.
+    """
+    with _trade_log_lock:
+        pending = [r for r in _trade_log if r.outcome == "filled" and not r.market_result]
+
+    for r in pending:
+        try:
+            data   = _kget(f"/markets/{r.ticker}")
+            market = data.get("market") or data
+            status = (market.get("status") or "").lower()
+            result = (market.get("result") or "").lower()
+            if status != "finalized" or result not in ("yes", "no"):
+                continue
+            pnl = ((1.0 - r.fill_price) if result == "yes" else (-r.fill_price)) * r.contracts
+            with _trade_log_lock:
+                r.market_result = result
+                r.pnl           = round(pnl, 2)
+                _save_trade_log()
+            log.info(
+                "Trade resolved: %s → %s | P&L: $%+.2f", r.ticker, result.upper(), pnl
+            )
+            send_telegram(
+                f"Trade resolved\n"
+                f"{r.away_team} @ {r.home_team} ({r.league})\n"
+                f"Result: {result.upper()} | P&L: ${pnl:+.2f}\n"
+                f"Entry: ${r.entry_price:.2f} × {r.contracts} contracts"
+            )
+        except Exception as exc:
+            log.debug("Could not check resolution for %s: %s", r.ticker, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +648,16 @@ def fetch_kalshi_markets(series: str) -> list[dict]:
 
 
 def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
-    """Return (yes_ask_dollars, ask_size) or (None, 0) if no book."""
+    """Return (yes_ask_dollars, ask_size) or (None, 0) if no book.
+
+    Kalshi orderbook fields:
+      'no'  — NO bid levels [[price_cents, qty], ...] descending.
+              Best NO bid → implied YES ask = (100 - no_lvls[0][0]) / 100
+      'yes' — YES ask levels [[price_cents, qty], ...] ascending.
+              Present when sellers post explicit YES limit orders with no
+              matching NO bids on the other side.
+    Both paths are valid routes to buying YES.
+    """
     try:
         data = _kget(f"/markets/{ticker}/orderbook")
     except Exception as exc:
@@ -545,15 +668,27 @@ def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
     no_lvls  = ob.get("no") or []
     yes_lvls = ob.get("yes") or []
 
-    if not no_lvls:
-        return None, 0
+    # Primary: derive YES ask from best NO bid
+    if no_lvls:
+        best_no_bid_cents = no_lvls[0][0]
+        yes_ask  = (100 - best_no_bid_cents) / 100.0
+        ask_size = no_lvls[0][1] if len(no_lvls[0]) > 1 else 0
+        return yes_ask, ask_size
 
-    best_no_bid_cents = no_lvls[0][0]
-    yes_ask           = (100 - best_no_bid_cents) / 100.0
-    # ask_size comes from the NO bid size (complementary)
-    ask_size          = no_lvls[0][1] if len(no_lvls[0]) > 1 else 0
+    # Fallback: YES ask orders posted directly on the YES side.
+    # These are sorted ascending (lowest ask = best for buyer is first).
+    if yes_lvls:
+        log.warning(
+            "%s: no NO bids — using direct YES ask levels: %s",
+            ticker, yes_lvls[:3],
+        )
+        best_yes_ask_cents = yes_lvls[0][0]
+        yes_ask  = best_yes_ask_cents / 100.0
+        ask_size = yes_lvls[0][1] if len(yes_lvls[0]) > 1 else 0
+        return yes_ask, ask_size
 
-    return yes_ask, ask_size
+    log.warning("No orderbook for %s — empty on both sides", ticker)
+    return None, 0
 
 
 def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
@@ -571,7 +706,20 @@ def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
     for event_tick, team_map in games.items():
         seg = event_tick.split("-")[-1].upper()
         if home in seg and away in seg:
-            return team_map.get(g.leading_team.upper())
+            ticker = team_map.get(g.leading_team.upper())
+            if ticker:
+                log.info("Matched Kalshi ticker: %s (teams in seg: %s)", ticker, seg)
+            else:
+                log.warning(
+                    "Event matched (%s) but no ticker for leader %s — available: %s",
+                    seg, g.leading_team, list(team_map.keys()),
+                )
+            return ticker
+    log.warning(
+        "No Kalshi market matched for %s @ %s — checked %d event(s): %s",
+        away, home, len(games),
+        [ev.split("-")[-1] for ev in list(games.keys())[:10]],
+    )
     return None
 
 
@@ -591,7 +739,7 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         return False
 
     if ask_size < MIN_LIQUIDITY:
-        log.info("SKIP %s: ask_size=%d < MIN_LIQUIDITY=%d", ticker, ask_size, MIN_LIQUIDITY)
+        log.warning("SKIP %s: liquidity too low (ask_size=%d, need %d)", ticker, ask_size, MIN_LIQUIDITY)
         return False
 
     num_contracts = max(1, int(BET_AMOUNT / ask))
@@ -640,6 +788,23 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
     state.total_exposure += cost
     state.bets_placed    += 1
     state.already_traded.append(game.espn_id)
+
+    _record_trade(TradeRecord(
+        order_id           = order_id,
+        ticker             = ticker,
+        espn_id            = game.espn_id,
+        league             = game.league.name,
+        away_team          = game.away_team,
+        home_team          = game.home_team,
+        leading_team       = game.leading_team,
+        diff               = game.diff,
+        period             = game.period,
+        time_remaining_sec = game.time_remaining_sec,
+        entry_price        = ask,
+        contracts          = num_contracts,
+        cost               = cost,
+        entry_ts           = time.time(),
+    ))
 
     msg = (
         f"BET PLACED\n"
@@ -723,6 +888,7 @@ td{padding:5px 8px;border-bottom:1px solid #21262d;font-size:12px}
 .ll{white-space:pre-wrap;line-height:1.7;font-size:12px}
 .INFO{color:#c9d1d9}.WARN{color:#e3b341}.ERROR{color:#f85149}.DEBUG{color:#484f58}
 .empty{color:#484f58;font-style:italic}
+.pnl-pos{color:#3fb950;font-weight:700}.pnl-neg{color:#f85149;font-weight:700}
 .footer{color:#484f58;font-size:11px;margin-top:10px}
 </style></head>
 <body>
@@ -731,6 +897,7 @@ td{padding:5px 8px;border-bottom:1px solid #21262d;font-size:12px}
 <div class="badges" id="badges"></div>
 <div class="grid" id="stats"></div>
 <div class="box"><div class="box-title">Open Orders</div><div id="orders"></div></div>
+<div class="box"><div class="box-title">Trade History</div><div id="trade-summary" style="margin-bottom:10px;font-size:12px"></div><div id="trades"></div></div>
 <div class="box"><div class="box-title">Recent Logs</div><div class="log" id="logs"></div></div>
 <div class="footer" id="footer"></div>
 <script>
@@ -751,6 +918,18 @@ async function refresh(){
       '<table><thead><tr><th>Ticker</th><th>Price \u00d7 Qty</th><th>Cost</th><th>Age</th></tr></thead><tbody>'+
       d.open_orders.map(function(o){var age=fmt(now-o.submitted_at);return'<tr><td>'+o.ticker+'</td><td>$'+o.price.toFixed(2)+' \u00d7 '+o.contracts+'</td><td>$'+(o.price*o.contracts).toFixed(2)+'</td><td>'+age+' old</td></tr>'}).join('')+
       '</tbody></table>':'<span class="empty">No open orders</span>';
+    var ts=d.trade_stats||{wins:0,losses:0,pending:0,total_pnl:0};
+    var pnlCls=ts.total_pnl>=0?'pnl-pos':'pnl-neg';
+    document.getElementById('trade-summary').innerHTML=
+      'W: <b class="pnl-pos">'+ts.wins+'</b> &nbsp;L: <b class="pnl-neg">'+ts.losses+'</b> &nbsp;Pending: <b>'+ts.pending+'</b> &nbsp;Total P&amp;L: <b class="'+pnlCls+'">$'+ts.total_pnl.toFixed(2)+'</b>';
+    document.getElementById('trades').innerHTML=d.recent_trades&&d.recent_trades.length?
+      '<table><thead><tr><th>Time</th><th>Matchup</th><th>Leader +pts</th><th>T-Rem</th><th>Entry $</th><th>Qty</th><th>Outcome</th><th>P&amp;L</th></tr></thead><tbody>'+
+      d.recent_trades.map(function(t){
+        var dt=new Date(t.entry_ts*1000).toLocaleString();
+        var result=t.market_result?t.market_result.toUpperCase():t.outcome;
+        var pnl=t.pnl!==0?'<span class="'+(t.pnl>=0?'pnl-pos':'pnl-neg')+'">$'+t.pnl.toFixed(2)+'</span>':'\u2014';
+        return'<tr><td>'+dt+'</td><td>'+t.away_team+' @ '+t.home_team+'</td><td>'+t.leading_team+' +'+t.diff+'</td><td>'+Math.round(t.time_remaining_sec/60)+'m</td><td>$'+t.entry_price.toFixed(2)+'</td><td>'+t.contracts+'</td><td>'+result+'</td><td>'+pnl+'</td></tr>';
+      }).join('')+'</tbody></table>':'<span class="empty">No trades yet</span>';
     document.getElementById('logs').innerHTML=d.logs.length?d.logs.map(function(l){
       var lv=(l.match(/\\[(INFO|WARNING|ERROR|DEBUG)\\]/)||['','INFO'])[1],c=lv==='WARNING'?'WARN':lv;
       return'<div class="ll '+c+'">'+l.replace(/</g,'&lt;')+'</div>'}).join(''):'<span class="empty">No log lines yet</span>';
@@ -781,6 +960,18 @@ def _dash_api():
         "max_total_exposure": MAX_TOTAL_EXPOSURE,
         "num_contracts":      NUM_CONTRACTS,
     }
+
+    with _trade_log_lock:
+        trades_copy = [asdict(r) for r in _trade_log]
+    trades_copy.sort(key=lambda r: r["entry_ts"], reverse=True)
+    data["recent_trades"] = trades_copy[:25]
+    data["trade_stats"]   = {
+        "wins":      sum(1 for r in trades_copy if r["market_result"] == "yes"),
+        "losses":    sum(1 for r in trades_copy if r["market_result"] == "no"),
+        "pending":   sum(1 for r in trades_copy if r["outcome"] == "filled" and not r["market_result"]),
+        "total_pnl": round(sum(r["pnl"] for r in trades_copy), 2),
+    }
+
     return jsonify(data)
 
 
@@ -793,9 +984,11 @@ def _start_dashboard() -> None:
 # ---------------------------------------------------------------------------
 
 def monitor() -> None:
-    global _app_state_ref
+    global _app_state_ref, _trade_log
     state = load_state()
     _app_state_ref = state
+    _trade_log = load_trade_log()
+    log.info("Trade log    : %d historical trade(s) loaded", len(_trade_log))
 
     signal.signal(signal.SIGINT,  lambda s, f: _handle_shutdown(state, s, f))
     signal.signal(signal.SIGTERM, lambda s, f: _handle_shutdown(state, s, f))
@@ -839,6 +1032,7 @@ def monitor() -> None:
             # ── Track existing open orders (fills + stale cancellations) ──
             poll_orders(state)
             save_state(state)
+            resolve_trades()
 
             # ── Refresh Kalshi markets ──
             kalshi_markets: dict[str, list[dict]] = {}
@@ -865,7 +1059,8 @@ def monitor() -> None:
                 continue
 
             # ── Scan ESPN ──
-            in_final = False
+            in_final     = False
+            near_blowout = False
 
             for league in LEAGUES:
                 games = fetch_espn_games(league)
@@ -892,6 +1087,10 @@ def monitor() -> None:
                     if g.espn_id in state.already_traded:
                         continue
 
+                    # Speed up polling once a game is within 5 pts of the threshold
+                    if g.diff >= NEAR_BLOWOUT_DIFF and g.time_remaining_sec <= BLOWOUT_TIME_SEC + 600:
+                        near_blowout = True
+
                     if not is_blowout(g):
                         continue
 
@@ -899,12 +1098,14 @@ def monitor() -> None:
                         "BLOWOUT: %s leads %s by %d pts — %.1f min left",
                         g.leading_team, g.trailing_team, g.diff, t_min,
                     )
-                    send_telegram(
-                        f"BLOWOUT DETECTED\n"
-                        f"{g.away_team} @ {g.home_team} — {league.name}\n"
-                        f"{g.leading_team} leads by {g.diff} pts\n"
-                        f"Period {g.period} | {t_min:.1f} min remaining"
-                    )
+                    if g.espn_id not in state.blowout_notified:
+                        send_telegram(
+                            f"BLOWOUT DETECTED\n"
+                            f"{g.away_team} @ {g.home_team} — {league.name}\n"
+                            f"{g.leading_team} leads by {g.diff} pts\n"
+                            f"Period {g.period} | {t_min:.1f} min remaining"
+                        )
+                        state.blowout_notified.append(g.espn_id)
 
                     ticker = find_winning_ticker(g, kalshi_markets.get(league.name, []))
                     if ticker is None:
@@ -923,7 +1124,12 @@ def monitor() -> None:
                     place_bet(ticker, g, state)
                     save_state(state)
 
-        interval = POLL_INTERVAL_FINAL if in_final else POLL_INTERVAL_SEC
+        if in_final:
+            interval = POLL_INTERVAL_FINAL
+        elif near_blowout:
+            interval = POLL_INTERVAL_NEAR
+        else:
+            interval = POLL_INTERVAL_SEC
         log.info("Sleeping %ds…", interval)
         time.sleep(interval)
 
