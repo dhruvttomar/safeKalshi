@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # Kalshi API
 KALSHI_API_BASE        = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")

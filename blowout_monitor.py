@@ -116,7 +116,7 @@ def send_telegram(msg: str) -> None:
             timeout=8,
         )
     except Exception as exc:
-        log.debug("Telegram send failed: %s", exc)
+        log.warning("Telegram send failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +159,7 @@ ESPN_TO_KALSHI: dict[str, str] = {
     "PHO":  "PHX",
     "UTAH": "UTA",
     "WSH":  "WAS",
+    "SC":   "USC",
 }
 
 
@@ -664,30 +665,45 @@ def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
         log.warning("Orderbook fetch failed for %s: %s", ticker, exc)
         return None, 0
 
-    ob       = data.get("orderbook") or {}
-    no_lvls  = ob.get("no") or []
-    yes_lvls = ob.get("yes") or []
+    ob = data.get("orderbook") or data.get("orderbook_fp")
+    if ob is None:
+        log.warning("Orderbook key missing for %s — raw response keys: %s", ticker, list(data.keys()))
+        return None, 0
 
-    # Primary: derive YES ask from best NO bid
-    if no_lvls:
-        best_no_bid_cents = no_lvls[0][0]
-        yes_ask  = (100 - best_no_bid_cents) / 100.0
-        ask_size = no_lvls[0][1] if len(no_lvls[0]) > 1 else 0
-        return yes_ask, ask_size
+    # Kalshi returns two possible formats:
+    #   "orderbook":    {"no": [[cents_int, qty], ...] descending,  "yes": [[cents_int, qty], ...] ascending}
+    #   "orderbook_fp": {"no_dollars": [["0.xx", "qty"], ...] ascending, "yes_dollars": [...] ascending}
+    if "no_dollars" in ob or "yes_dollars" in ob:
+        # Dollar-string format — ascending sort; best NO bid is the LAST element
+        no_lvls_d  = ob.get("no_dollars") or []
+        yes_lvls_d = ob.get("yes_dollars") or []
+        if no_lvls_d:
+            best_no_bid = float(no_lvls_d[-1][0])        # highest NO bid
+            yes_ask  = round(1.0 - best_no_bid, 4)
+            ask_size = int(float(no_lvls_d[-1][1])) if len(no_lvls_d[-1]) > 1 else 0
+            return yes_ask, ask_size
+        if yes_lvls_d:
+            log.warning("%s: no NO bids — using direct YES ask (dollars): %s", ticker, yes_lvls_d[:3])
+            yes_ask  = float(yes_lvls_d[0][0])           # lowest YES ask
+            ask_size = int(float(yes_lvls_d[0][1])) if len(yes_lvls_d[0]) > 1 else 0
+            return yes_ask, ask_size
+    else:
+        # Integer-cents format — descending sort; best NO bid is the FIRST element
+        no_lvls  = ob.get("no") or []
+        yes_lvls = ob.get("yes") or []
+        if no_lvls:
+            best_no_bid_cents = no_lvls[0][0]
+            yes_ask  = (100 - best_no_bid_cents) / 100.0
+            ask_size = no_lvls[0][1] if len(no_lvls[0]) > 1 else 0
+            return yes_ask, ask_size
+        if yes_lvls:
+            log.warning("%s: no NO bids — using direct YES ask levels: %s", ticker, yes_lvls[:3])
+            best_yes_ask_cents = yes_lvls[0][0]
+            yes_ask  = best_yes_ask_cents / 100.0
+            ask_size = yes_lvls[0][1] if len(yes_lvls[0]) > 1 else 0
+            return yes_ask, ask_size
 
-    # Fallback: YES ask orders posted directly on the YES side.
-    # These are sorted ascending (lowest ask = best for buyer is first).
-    if yes_lvls:
-        log.warning(
-            "%s: no NO bids — using direct YES ask levels: %s",
-            ticker, yes_lvls[:3],
-        )
-        best_yes_ask_cents = yes_lvls[0][0]
-        yes_ask  = best_yes_ask_cents / 100.0
-        ask_size = yes_lvls[0][1] if len(yes_lvls[0]) > 1 else 0
-        return yes_ask, ask_size
-
-    log.warning("No orderbook for %s — empty on both sides", ticker)
+    log.warning("No orderbook for %s — empty on both sides. Raw ob: %s", ticker, ob)
     return None, 0
 
 
@@ -704,15 +720,15 @@ def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
 
     home, away = g.home_team.upper(), g.away_team.upper()
     for event_tick, team_map in games.items():
-        seg = event_tick.split("-")[-1].upper()
-        if home in seg and away in seg:
+        event_str = event_tick.upper()
+        if home in event_str and away in event_str:
             ticker = team_map.get(g.leading_team.upper())
             if ticker:
-                log.info("Matched Kalshi ticker: %s (teams in seg: %s)", ticker, seg)
+                log.info("Matched Kalshi ticker: %s (event: %s)", ticker, event_str)
             else:
                 log.warning(
                     "Event matched (%s) but no ticker for leader %s — available: %s",
-                    seg, g.leading_team, list(team_map.keys()),
+                    event_str, g.leading_team, list(team_map.keys()),
                 )
             return ticker
     log.warning(
