@@ -60,9 +60,10 @@ BLOWOUT_DIFF          = 22      # minimum point differential
 BLOWOUT_TIME_SEC      = 1260    # 21 min = 1260 s remaining in regulation
 POLL_INTERVAL_SEC     = 30      # normal poll cadence
 POLL_INTERVAL_FINAL   = 10      # poll cadence when any game is in its last period
-STALE_ORDER_SEC       = 300     # cancel unfilled orders after 5 min
 MAX_YES_ASK           = 0.98    # don't buy if market is already at 98 c — no edge
+MIN_YES_ASK           = 0.05    # skip if ask is below 5 c — likely a junk/stale orderbook
 MIN_LIQUIDITY         = 3       # minimum contracts available on the ask side
+MAX_CONTRACTS_PER_ORDER = 5000  # Kalshi per-order contract cap (avoids 400 on huge orders)
 
 STATE_FILE            = Path("blowout_state.json")
 TRADE_LOG_FILE        = Path("trade_log.json")
@@ -84,6 +85,23 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("blowout")
+
+# ---------------------------------------------------------------------------
+# Dedicated blowout + order log files (separate from bot.log)
+# ---------------------------------------------------------------------------
+
+def _make_file_logger(name: str, filepath: str) -> logging.Logger:
+    _fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _h   = logging.FileHandler(filepath)
+    _h.setFormatter(_fmt)
+    _l   = logging.getLogger(name)
+    _l.setLevel(logging.INFO)
+    _l.addHandler(_h)
+    _l.propagate = False   # never touches bot.log
+    return _l
+
+_blowout_log = _make_file_logger("blowout_events", "blowout.log")
+_orders_log  = _make_file_logger("order_events",   "orders.log")
 
 # In-memory ring buffer — dashboard reads from this
 _log_buffer: collections.deque = collections.deque(maxlen=200)
@@ -182,6 +200,7 @@ class GameState:
     period: int
     clock_sec: float
     status: str        # "pre" | "in" | "post"
+    game_date: str     = ""   # YYYY-MM-DD local date of the game (from ESPN)
 
     @property
     def diff(self) -> int:
@@ -352,7 +371,8 @@ def check_risk(state: AppState, ask: float, contracts: int) -> None:
 
 def poll_orders(state: AppState) -> None:
     """
-    For every open order: check if stale (cancel) or filled (record).
+    For every open order: check if filled (record) or externally cancelled.
+    Orders are held until the game ends — no time-based stale cancellation.
     Mutates state in place; caller should save_state afterwards.
     """
     if not state.open_orders:
@@ -365,30 +385,6 @@ def poll_orders(state: AppState) -> None:
         order_id = o["order_id"]
         ticker   = o["ticker"]
         cost     = o["price"] * o["contracts"]
-        age      = now - o["submitted_at"]
-
-        # ── Stale: cancel ──
-        if age >= STALE_ORDER_SEC:
-            log.info("Cancelling stale order %s (%ds old)", order_id, int(age))
-            try:
-                utils.api_request(
-                    "DELETE",
-                    f"{config.KALSHI_API_BASE}/portfolio/orders/{order_id}",
-                    authenticated=True,
-                )
-                state.total_exposure = max(0.0, state.total_exposure - cost)
-                msg = (
-                    f"Stale order cancelled\n"
-                    f"Ticker: {ticker}\n"
-                    f"Age: {int(age)}s | Exposure freed: ${cost:.2f}"
-                )
-                log.info(msg)
-                send_telegram(msg)
-                _update_trade(order_id, outcome="cancelled", fill_ts=now)
-            except Exception as exc:
-                log.error("Could not cancel stale order %s: %s", order_id, exc)
-                still_open.append(o)
-            continue
 
         # ── Poll status ──
         try:
@@ -417,16 +413,63 @@ def poll_orders(state: AppState) -> None:
                 f"Max profit if YES wins: ${to_win:.2f}"
             )
             log.info(msg)
+            _orders_log.info("FILLED  | %s | $%.2f x %d | to_win $%.2f", ticker, avg_price, filled, to_win)
             send_telegram(msg)
             _update_trade(order_id, outcome="filled", fill_price=avg_price, fill_ts=now)
 
         elif status in ("cancelled", "canceled", "expired"):
             state.total_exposure = max(0.0, state.total_exposure - cost)
             log.info("Order externally cancelled: %s", order_id)
+            _orders_log.info("CANCELLED_EXT | %s | order_id=%s", ticker, order_id)
             _update_trade(order_id, outcome="cancelled", fill_ts=now)
 
         else:
             still_open.append(o)   # still resting on the book
+
+    state.open_orders = still_open
+
+
+def cancel_orders_for_finished_games(state: AppState, finished_espn_ids: set) -> None:
+    """
+    Cancel any open orders whose game has just ended (ESPN status = 'post').
+    Called once per poll cycle after ESPN scores are fetched.
+    Mutates state in place; caller should save_state afterwards.
+    """
+    if not state.open_orders or not finished_espn_ids:
+        return
+
+    now = time.time()
+    still_open = []
+
+    for o in list(state.open_orders):
+        if o.get("espn_id") not in finished_espn_ids:
+            still_open.append(o)
+            continue
+
+        order_id = o["order_id"]
+        ticker   = o["ticker"]
+        cost     = o["price"] * o["contracts"]
+
+        log.info("Game over — cancelling open order %s (%s)", order_id, ticker)
+        try:
+            utils.api_request(
+                "DELETE",
+                f"{config.KALSHI_API_BASE}/portfolio/orders/{order_id}",
+                authenticated=True,
+            )
+            state.total_exposure = max(0.0, state.total_exposure - cost)
+            msg = (
+                f"Game ended — order cancelled\n"
+                f"Ticker: {ticker}\n"
+                f"Exposure freed: ${cost:.2f}"
+            )
+            log.info(msg)
+            _orders_log.info("CANCELLED_GAME_END | %s | exposure_freed $%.2f", ticker, cost)
+            send_telegram(msg)
+            _update_trade(order_id, outcome="cancelled", fill_ts=now)
+        except Exception as exc:
+            log.error("Could not cancel end-of-game order %s: %s", order_id, exc)
+            still_open.append(o)
 
     state.open_orders = still_open
 
@@ -581,6 +624,8 @@ def fetch_espn_games(league: LeagueConfig) -> list[GameState]:
             period  = int(status.get("period") or 0)
             home    = next(c for c in comp["competitors"] if c["homeAway"] == "home")
             away    = next(c for c in comp["competitors"] if c["homeAway"] == "away")
+            # ESPN date is ISO-8601 UTC like "2026-04-07T23:00Z"; take just the date part
+            raw_date   = (event.get("date") or "")[:10]   # "YYYY-MM-DD"
             states.append(GameState(
                 espn_id    = event["id"],
                 league     = league,
@@ -591,6 +636,7 @@ def fetch_espn_games(league: LeagueConfig) -> list[GameState]:
                 period     = period,
                 clock_sec  = clock,
                 status     = state_s,
+                game_date  = raw_date,
             ))
         except Exception as exc:
             log.debug("ESPN parse error for event %s: %s", event.get("id"), exc)
@@ -707,8 +753,25 @@ def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
     return None, 0
 
 
+_MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+
+def _kalshi_date_str(iso_date: str) -> str:
+    """Convert 'YYYY-MM-DD' → Kalshi date fragment 'YYMONDD', e.g. '2026-04-07' → '26APR07'."""
+    try:
+        y, m, d = iso_date.split("-")
+        return f"{y[2:]}{_MONTH_ABBR[int(m)-1]}{d}"
+    except Exception:
+        return ""
+
+
 def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
-    """Return the Kalshi ticker for the leading team, or None if not found."""
+    """Return the Kalshi ticker for the leading team, or None if not found.
+
+    Matches on both team codes AND the game date (YYMONDD fragment) to avoid
+    picking a same-matchup market from a different day that is still open.
+    """
+    date_frag = _kalshi_date_str(g.game_date)   # e.g. "26APR07"; "" if unknown
+
     games: dict[str, dict[str, str]] = {}
     for m in markets:
         parts = m.get("ticker", "").split("-")
@@ -721,19 +784,27 @@ def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
     home, away = g.home_team.upper(), g.away_team.upper()
     for event_tick, team_map in games.items():
         event_str = event_tick.upper()
-        if home in event_str and away in event_str:
-            ticker = team_map.get(g.leading_team.upper())
-            if ticker:
-                log.info("Matched Kalshi ticker: %s (event: %s)", ticker, event_str)
-            else:
-                log.warning(
-                    "Event matched (%s) but no ticker for leader %s — available: %s",
-                    event_str, g.leading_team, list(team_map.keys()),
-                )
-            return ticker
+        if home not in event_str or away not in event_str:
+            continue
+        # Require date match when we have a valid date fragment
+        if date_frag and date_frag not in event_str:
+            log.debug(
+                "Skipping %s — teams match but date fragment %s not found",
+                event_str, date_frag,
+            )
+            continue
+        ticker = team_map.get(g.leading_team.upper())
+        if ticker:
+            log.info("Matched Kalshi ticker: %s (event: %s)", ticker, event_str)
+        else:
+            log.warning(
+                "Event matched (%s) but no ticker for leader %s — available: %s",
+                event_str, g.leading_team, list(team_map.keys()),
+            )
+        return ticker
     log.warning(
-        "No Kalshi market matched for %s @ %s — checked %d event(s): %s",
-        away, home, len(games),
+        "No Kalshi market matched for %s @ %s (date: %s) — checked %d event(s): %s",
+        away, home, date_frag or "unknown", len(games),
         [ev.split("-")[-1] for ev in list(games.keys())[:10]],
     )
     return None
@@ -754,11 +825,19 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         log.warning("No orderbook for %s — skipping", ticker)
         return False
 
+    if ask < MIN_YES_ASK:
+        log.warning(
+            "SKIP %s: YES ask $%.4f is below floor $%.2f — likely junk/inverted orderbook",
+            ticker, ask, MIN_YES_ASK,
+        )
+        state.already_traded.append(game.espn_id)
+        return False
+
     if ask_size < MIN_LIQUIDITY:
         log.warning("SKIP %s: liquidity too low (ask_size=%d, need %d)", ticker, ask_size, MIN_LIQUIDITY)
         return False
 
-    num_contracts = max(1, int(BET_AMOUNT / ask))
+    num_contracts = max(1, min(int(BET_AMOUNT / ask), MAX_CONTRACTS_PER_ORDER))
 
     try:
         check_risk(state, ask, num_contracts)
@@ -784,8 +863,14 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
             json_body=body,
         )
     except Exception as exc:
-        log.error("Order submission failed for %s: %s", ticker, exc)
+        body_text = ""
+        if hasattr(exc, "response") and exc.response is not None:
+            body_text = f"\nAPI response: {exc.response.text[:300]}"
+        log.error("Order submission failed for %s: %s%s", ticker, exc, body_text)
+        _orders_log.info("FAILED  | %s | %s", ticker, exc)
         send_telegram(f"Order FAILED: {ticker}\n{exc}")
+        # Mark as already handled so we don't spam the same failed order every poll cycle
+        state.already_traded.append(game.espn_id)
         return False
 
     raw      = resp.get("order") or resp
@@ -833,6 +918,10 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
         f"Daily spend: ${state.daily_spend:.2f} / ${MAX_DAILY_SPEND:.2f}"
     )
     log.info(msg)
+    _orders_log.info(
+        "PLACED  | %s | ask $%.2f x %d = $%.2f | order_id=%s",
+        ticker, ask, num_contracts, cost, order_id,
+    )
     send_telegram(msg)
     return True
 
@@ -1074,12 +1163,25 @@ def monitor() -> None:
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── Scan ESPN ──
-            in_final     = False
-            near_blowout = False
+            # ── Scan ESPN (single fetch per league) ──
+            in_final        = False
+            near_blowout    = False
+            finished_ids: set = set()
+            espn_games: dict  = {}   # league.name → list[GameState]
 
             for league in LEAGUES:
                 games = fetch_espn_games(league)
+                espn_games[league.name] = games
+                for g in games:
+                    if g.status == "post":
+                        finished_ids.add(g.espn_id)
+
+            # Cancel orders whose games just finished (hold until game-end)
+            cancel_orders_for_finished_games(state, finished_ids)
+            save_state(state)
+
+            for league in LEAGUES:
+                games = espn_games.get(league.name, [])
                 live  = [g for g in games if g.status == "in"]
 
                 if any(g.period >= league.total_periods for g in live):
@@ -1103,6 +1205,14 @@ def monitor() -> None:
                     if g.espn_id in state.already_traded:
                         continue
 
+                    # Only one active bet at a time
+                    if state.open_orders:
+                        log.info(
+                            "SKIP %s @ %s — already have an open order, holding to game-end first",
+                            g.away_team, g.home_team,
+                        )
+                        continue
+
                     # Speed up polling once a game is within 5 pts of the threshold
                     if g.diff >= NEAR_BLOWOUT_DIFF and g.time_remaining_sec <= BLOWOUT_TIME_SEC + 600:
                         near_blowout = True
@@ -1113,6 +1223,11 @@ def monitor() -> None:
                     log.info(
                         "BLOWOUT: %s leads %s by %d pts — %.1f min left",
                         g.leading_team, g.trailing_team, g.diff, t_min,
+                    )
+                    _blowout_log.info(
+                        "%s @ %s | %s leads by %d | P%d %.1f min left | %s",
+                        g.away_team, g.home_team, g.leading_team, g.diff,
+                        g.period, t_min, league.name,
                     )
                     if g.espn_id not in state.blowout_notified:
                         send_telegram(
