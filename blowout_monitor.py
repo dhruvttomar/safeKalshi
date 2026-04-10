@@ -562,8 +562,8 @@ def _tg_command_loop(state: AppState) -> None:
                             "/stop        — graceful shutdown\n"
                             "/help        — this message"
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Telegram poll error: %s", exc)
         time.sleep(2)
 
 
@@ -1138,22 +1138,37 @@ def monitor() -> None:
     )
 
     while True:
+        # ── Phase 1: External API fetches — no lock held ──────────────────
+        # These can take several seconds; keeping them outside the lock means
+        # the dashboard and Telegram commands stay responsive during fetches.
+        kalshi_markets: dict[str, list[dict]] = {}
+        for league in LEAGUES:
+            try:
+                kalshi_markets[league.name] = fetch_kalshi_markets(league.kalshi_series)
+            except Exception as exc:
+                log.warning("Kalshi fetch failed for %s: %s", league.name, exc)
+                kalshi_markets[league.name] = []
+
+        espn_games: dict  = {}
+        finished_ids: set = set()
+        for league in LEAGUES:
+            games = fetch_espn_games(league)
+            espn_games[league.name] = games
+            for g in games:
+                if g.status == "post":
+                    finished_ids.add(g.espn_id)
+
+        in_final     = False
+        near_blowout = False
+
+        # ── Phase 2: State maintenance + blowout detection — lock held ────
         with _state_lock:
             maybe_reset_daily(state)
 
-            # ── Track existing open orders (fills + stale cancellations) ──
+            # Track existing open orders (fills + externally cancelled)
             poll_orders(state)
             save_state(state)
             resolve_trades()
-
-            # ── Refresh Kalshi markets ──
-            kalshi_markets: dict[str, list[dict]] = {}
-            for league in LEAGUES:
-                try:
-                    kalshi_markets[league.name] = fetch_kalshi_markets(league.kalshi_series)
-                except Exception as exc:
-                    log.warning("Kalshi fetch failed for %s: %s", league.name, exc)
-                    kalshi_markets[league.name] = []
 
             total_kalshi = sum(len(v) for v in kalshi_markets.values())
             log.info(
@@ -1167,106 +1182,91 @@ def monitor() -> None:
             # Check if daily spend limit is hit — no point scanning
             if state.daily_spend >= MAX_DAILY_SPEND:
                 log.warning("Daily spend limit reached ($%.2f) — no new bets today", state.daily_spend)
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
+                # Do NOT sleep inside the lock — fall through to sleep below
+            else:
+                # Cancel orders whose games just finished (hold until game-end)
+                cancel_orders_for_finished_games(state, finished_ids)
+                save_state(state)
 
-            # ── Scan ESPN (single fetch per league) ──
-            in_final        = False
-            near_blowout    = False
-            finished_ids: set = set()
-            espn_games: dict  = {}   # league.name → list[GameState]
+                for league in LEAGUES:
+                    games = espn_games.get(league.name, [])
+                    live  = [g for g in games if g.status == "in"]
 
-            for league in LEAGUES:
-                games = fetch_espn_games(league)
-                espn_games[league.name] = games
-                for g in games:
-                    if g.status == "post":
-                        finished_ids.add(g.espn_id)
+                    if any(g.period >= league.total_periods for g in live):
+                        in_final = True
 
-            # Cancel orders whose games just finished (hold until game-end)
-            cancel_orders_for_finished_games(state, finished_ids)
-            save_state(state)
-
-            for league in LEAGUES:
-                games = espn_games.get(league.name, [])
-                live  = [g for g in games if g.status == "in"]
-
-                if any(g.period >= league.total_periods for g in live):
-                    in_final = True
-
-                if not live:
-                    log.debug("%s: no live games", league.name)
-                    continue
-
-                log.info("%s: %d live game(s)", league.name, len(live))
-
-                for g in live:
-                    t_min = g.time_remaining_sec / 60
-
-                    # Compute inline annotation — only for games that qualify or nearly qualify
-                    if g.espn_id in state.already_traded:
-                        note = " | SKIP: already traded"
-                    elif is_blowout(g) and state.open_orders:
-                        note = f" | BLOWOUT — NOT BOUGHT: waiting for open order ({state.open_orders[0]['ticker']}) to settle"
-                    elif is_blowout(g):
-                        note = f" | BLOWOUT — {g.leading_team} +{g.diff} — attempting bet"
-                    else:
-                        note = ""
-
-                    log.info(
-                        "  %s @ %s  %d-%d (diff %d)  P%d %.0fs (%.1f min left)%s",
-                        g.away_team, g.home_team,
-                        g.away_score, g.home_score,
-                        g.diff, g.period, g.clock_sec, t_min,
-                        note,
-                    )
-
-                    if g.espn_id in state.already_traded:
+                    if not live:
+                        log.debug("%s: no live games", league.name)
                         continue
 
-                    # Only one active bet at a time
-                    if state.open_orders:
-                        continue
+                    log.info("%s: %d live game(s)", league.name, len(live))
 
-                    # Speed up polling once a game is within 5 pts of the threshold
-                    if g.diff >= NEAR_BLOWOUT_DIFF and g.time_remaining_sec <= BLOWOUT_TIME_SEC + 600:
-                        near_blowout = True
+                    for g in live:
+                        t_min = g.time_remaining_sec / 60
 
-                    if not is_blowout(g):
-                        continue
+                        # Compute inline annotation so the reason is visible on every game log line
+                        if g.espn_id in state.already_traded:
+                            note = " | SKIP: already traded"
+                        elif is_blowout(g) and state.open_orders:
+                            note = f" | BLOWOUT — NOT BOUGHT: waiting for open order ({state.open_orders[0]['ticker']}) to settle"
+                        elif is_blowout(g):
+                            note = f" | BLOWOUT — {g.leading_team} +{g.diff} — attempting bet"
+                        else:
+                            note = ""
 
-                    log.info(
-                        "BLOWOUT: %s leads %s by %d pts — %.1f min left",
-                        g.leading_team, g.trailing_team, g.diff, t_min,
-                    )
-                    _blowout_log.info(
-                        "%s @ %s | %s leads by %d | P%d %.1f min left | %s",
-                        g.away_team, g.home_team, g.leading_team, g.diff,
-                        g.period, t_min, league.name,
-                    )
-                    if g.espn_id not in state.blowout_notified:
-                        send_telegram(
-                            f"BLOWOUT DETECTED\n"
-                            f"{g.away_team} @ {g.home_team} — {league.name}\n"
-                            f"{g.leading_team} leads by {g.diff} pts\n"
-                            f"Period {g.period} | {t_min:.1f} min remaining"
-                        )
-                        state.blowout_notified.append(g.espn_id)
-
-                    ticker = find_winning_ticker(g, kalshi_markets.get(league.name, []))
-                    if ticker is None:
-                        log.warning(
-                            "BLOWOUT %s @ %s — NOT BOUGHT: no Kalshi market matched (will retry next poll)",
+                        log.info(
+                            "  %s @ %s  %d-%d (diff %d)  P%d %.0fs (%.1f min left)%s",
                             g.away_team, g.home_team,
+                            g.away_score, g.home_score,
+                            g.diff, g.period, g.clock_sec, t_min,
+                            note,
                         )
-                        # Do NOT add to already_traded here — let the bot retry every poll
-                        # until the market appears or the game ends.
-                        # Telegram already fired via blowout_notified above.
-                        continue
 
-                    place_bet(ticker, g, state)
-                    save_state(state)
+                        if g.espn_id in state.already_traded:
+                            continue
 
+                        # Only one active bet at a time
+                        if state.open_orders:
+                            continue
+
+                        # Speed up polling once a game is within 5 pts of the threshold
+                        if g.diff >= NEAR_BLOWOUT_DIFF and g.time_remaining_sec <= BLOWOUT_TIME_SEC + 600:
+                            near_blowout = True
+
+                        if not is_blowout(g):
+                            continue
+
+                        log.info(
+                            "BLOWOUT: %s leads %s by %d pts — %.1f min left",
+                            g.leading_team, g.trailing_team, g.diff, t_min,
+                        )
+                        _blowout_log.info(
+                            "%s @ %s | %s leads by %d | P%d %.1f min left | %s",
+                            g.away_team, g.home_team, g.leading_team, g.diff,
+                            g.period, t_min, league.name,
+                        )
+                        if g.espn_id not in state.blowout_notified:
+                            send_telegram(
+                                f"BLOWOUT DETECTED\n"
+                                f"{g.away_team} @ {g.home_team} — {league.name}\n"
+                                f"{g.leading_team} leads by {g.diff} pts\n"
+                                f"Period {g.period} | {t_min:.1f} min remaining"
+                            )
+                            state.blowout_notified.append(g.espn_id)
+
+                        ticker = find_winning_ticker(g, kalshi_markets.get(league.name, []))
+                        if ticker is None:
+                            log.warning(
+                                "BLOWOUT %s @ %s — NOT BOUGHT: no Kalshi market matched (will retry next poll)",
+                                g.away_team, g.home_team,
+                            )
+                            # Do NOT add to already_traded — retry next poll
+                            continue
+
+                        place_bet(ticker, g, state)
+                        save_state(state)
+
+        # ── Sleep outside the lock so dashboard stays responsive ──────────
         if in_final:
             interval = POLL_INTERVAL_FINAL
         elif near_blowout:
