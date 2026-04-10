@@ -37,7 +37,8 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,7 @@ import utils
 # Configuration — all tunable via env vars
 # ---------------------------------------------------------------------------
 
-MAX_DAILY_SPEND       = float(os.getenv("MAX_DAILY_SPEND",     "100000"))
+MAX_DAILY_SPEND       = float(os.getenv("MAX_DAILY_SPEND",     "2000"))
 MAX_TOTAL_EXPOSURE    = float(os.getenv("MAX_TOTAL_EXPOSURE",  "100000"))
 BET_AMOUNT            = float(os.getenv("BET_AMOUNT",          "1000"))
 NUM_CONTRACTS         = int(os.getenv("NUM_CONTRACTS",         "1"))  # unused when BET_AMOUNT set
@@ -60,9 +61,9 @@ BLOWOUT_DIFF          = 22      # minimum point differential
 BLOWOUT_TIME_SEC      = 1260    # 21 min = 1260 s remaining in regulation
 POLL_INTERVAL_SEC     = 30      # normal poll cadence
 POLL_INTERVAL_FINAL   = 10      # poll cadence when any game is in its last period
-MAX_YES_ASK           = 0.98    # don't buy if market is already at 98 c — no edge
+MAX_YES_ASK           = 0.99    # don't buy if market is at 99 c — essentially no contracts to fill
 MIN_YES_ASK           = 0.05    # skip if ask is below 5 c — likely a junk/stale orderbook
-MIN_LIQUIDITY         = 3       # minimum contracts available on the ask side
+MIN_LIQUIDITY         = 1       # minimum contracts available on the ask side
 MAX_CONTRACTS_PER_ORDER = 5000  # Kalshi per-order contract cap (avoids 400 on huge orders)
 
 STATE_FILE            = Path("blowout_state.json")
@@ -334,11 +335,13 @@ def maybe_reset_daily(state: AppState) -> None:
     if state.date == today:
         return
     log.info("New trading day — resetting daily counters")
-    state.date         = today
-    state.daily_spend  = 0.0
-    state.bets_placed  = 0
-    state.bets_filled  = 0
-    # Preserve open_orders and already_traded across midnight (rare but correct)
+    state.date             = today
+    state.daily_spend      = 0.0
+    state.bets_placed      = 0
+    state.bets_filled      = 0
+    state.already_traded   = []   # yesterday's game IDs are irrelevant
+    state.blowout_notified = []   # reset so today's blowouts trigger fresh Telegram alerts
+    # Preserve open_orders across midnight — we still need to track those fills
     save_state(state)
 
 
@@ -361,8 +364,8 @@ def check_risk(state: AppState, ask: float, contracts: int) -> None:
         raise RiskBlocked(
             f"Exposure limit: ${state.total_exposure:.2f} + ${cost:.2f} > ${MAX_TOTAL_EXPOSURE:.2f}"
         )
-    if ask > MAX_YES_ASK:
-        raise RiskBlocked(f"Ask ${ask:.2f} exceeds MAX_YES_ASK ${MAX_YES_ASK:.2f} — no edge left")
+    if ask >= MAX_YES_ASK:
+        raise RiskBlocked(f"Ask ${ask:.2f} at/above MAX_YES_ASK ${MAX_YES_ASK:.2f} — market fully priced, no contracts to fill")
 
 
 # ---------------------------------------------------------------------------
@@ -624,8 +627,12 @@ def fetch_espn_games(league: LeagueConfig) -> list[GameState]:
             period  = int(status.get("period") or 0)
             home    = next(c for c in comp["competitors"] if c["homeAway"] == "home")
             away    = next(c for c in comp["competitors"] if c["homeAway"] == "away")
-            # ESPN date is ISO-8601 UTC like "2026-04-07T23:00Z"; take just the date part
-            raw_date   = (event.get("date") or "")[:10]   # "YYYY-MM-DD"
+            # ESPN date is ISO-8601 UTC; convert to Eastern to get the correct game date
+            _espn_dt = event.get("date") or ""
+            try:
+                raw_date = datetime.fromisoformat(_espn_dt.replace("Z", "+00:00")).astimezone(_EASTERN).strftime("%Y-%m-%d")
+            except Exception:
+                raw_date = _espn_dt[:10]
             states.append(GameState(
                 espn_id    = event["id"],
                 league     = league,
@@ -753,6 +760,7 @@ def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
     return None, 0
 
 
+_EASTERN = ZoneInfo("America/New_York")
 _MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
 def _kalshi_date_str(iso_date: str) -> str:
@@ -827,10 +835,9 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
 
     if ask < MIN_YES_ASK:
         log.warning(
-            "SKIP %s: YES ask $%.4f is below floor $%.2f — likely junk/inverted orderbook",
+            "SKIP %s: YES ask $%.4f is below floor $%.2f — likely junk/inverted orderbook (will retry)",
             ticker, ask, MIN_YES_ASK,
         )
-        state.already_traded.append(game.espn_id)
         return False
 
     if ask_size < MIN_LIQUIDITY:
@@ -1195,11 +1202,23 @@ def monitor() -> None:
 
                 for g in live:
                     t_min = g.time_remaining_sec / 60
+
+                    # Compute inline annotation — only for games that qualify or nearly qualify
+                    if g.espn_id in state.already_traded:
+                        note = " | SKIP: already traded"
+                    elif is_blowout(g) and state.open_orders:
+                        note = f" | BLOWOUT — NOT BOUGHT: waiting for open order ({state.open_orders[0]['ticker']}) to settle"
+                    elif is_blowout(g):
+                        note = f" | BLOWOUT — {g.leading_team} +{g.diff} — attempting bet"
+                    else:
+                        note = ""
+
                     log.info(
-                        "  %s @ %s  %d-%d (diff %d)  P%d %.0fs (%.1f min left)",
+                        "  %s @ %s  %d-%d (diff %d)  P%d %.0fs (%.1f min left)%s",
                         g.away_team, g.home_team,
                         g.away_score, g.home_score,
                         g.diff, g.period, g.clock_sec, t_min,
+                        note,
                     )
 
                     if g.espn_id in state.already_traded:
@@ -1207,10 +1226,6 @@ def monitor() -> None:
 
                     # Only one active bet at a time
                     if state.open_orders:
-                        log.info(
-                            "SKIP %s @ %s — already have an open order, holding to game-end first",
-                            g.away_team, g.home_team,
-                        )
                         continue
 
                     # Speed up polling once a game is within 5 pts of the threshold
@@ -1241,15 +1256,12 @@ def monitor() -> None:
                     ticker = find_winning_ticker(g, kalshi_markets.get(league.name, []))
                     if ticker is None:
                         log.warning(
-                            "No Kalshi market found for %s @ %s",
+                            "BLOWOUT %s @ %s — NOT BOUGHT: no Kalshi market matched (will retry next poll)",
                             g.away_team, g.home_team,
                         )
-                        send_telegram(
-                            f"No Kalshi market found\n"
-                            f"{g.away_team} @ {g.home_team} ({league.name})"
-                        )
-                        # Still mark as "handled" so we don't spam this warning every poll
-                        state.already_traded.append(g.espn_id)
+                        # Do NOT add to already_traded here — let the bot retry every poll
+                        # until the market appears or the game ends.
+                        # Telegram already fired via blowout_notified above.
                         continue
 
                     place_bet(ticker, g, state)
