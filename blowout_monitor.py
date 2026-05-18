@@ -46,6 +46,7 @@ import requests
 from flask import Flask, jsonify
 
 import config
+import gdrive
 import utils
 
 # ---------------------------------------------------------------------------
@@ -57,8 +58,19 @@ MAX_TOTAL_EXPOSURE    = float(os.getenv("MAX_TOTAL_EXPOSURE",  "100000"))
 BET_AMOUNT            = float(os.getenv("BET_AMOUNT",          "1000"))
 NUM_CONTRACTS         = int(os.getenv("NUM_CONTRACTS",         "1"))  # unused when BET_AMOUNT set
 
-BLOWOUT_DIFF          = 22      # minimum point differential
-BLOWOUT_TIME_SEC      = 1260    # 21 min = 1260 s remaining in regulation
+BLOWOUT_DIFF          = 22      # minimum point differential (NBA/NCAA)
+BLOWOUT_TIME_SEC      = 1260    # 21 min = 1260 s remaining in regulation (NBA/NCAA)
+NEAR_BLOWOUT_DIFF     = BLOWOUT_DIFF - 5   # 17 pts — start watching closely
+
+# WNBA-specific thresholds (shorter quarters → tighter parameters)
+WNBA_BLOWOUT_DIFF      = 20    # 20-point lead
+WNBA_BLOWOUT_TIME_SEC  = 1080  # 18 min = 1080 s remaining
+WNBA_NEAR_BLOWOUT_DIFF = WNBA_BLOWOUT_DIFF - 5  # 15 pts
+
+MAX_SCORE_DIFF        = 33      # sanity cap — any diff above this is corrupted ESPN data
+MIN_BLOWOUT_ASK       = 0.50   # if market prices the leader's YES below this, data contradicts market; skip
+NBA_CDN_TOLERANCE     = 3      # max pts ESPN and NBA CDN scores can disagree before blocking a trade
+
 POLL_INTERVAL_SEC     = 30      # normal poll cadence
 POLL_INTERVAL_FINAL   = 10      # poll cadence when any game is in its last period
 MAX_YES_ASK           = 0.99    # don't buy if market is at 99 c — essentially no contracts to fill
@@ -71,7 +83,6 @@ TRADE_LOG_FILE        = Path("trade_log.json")
 DASHBOARD_PORT        = int(os.getenv("DASHBOARD_PORT", "5001"))
 
 POLL_INTERVAL_NEAR    = 8       # poll cadence when any game is within 5 pts of blowout threshold
-NEAR_BLOWOUT_DIFF     = BLOWOUT_DIFF - 5   # 17 pts — start watching closely
 
 TELEGRAM_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -508,6 +519,22 @@ def resolve_trades() -> None:
                 f"Result: {result.upper()} | P&L: ${pnl:+.2f}\n"
                 f"Entry: ${r.entry_price:.2f} × {r.contracts} contracts"
             )
+            if result == "no":
+                gdrive.log_loss(
+                    ticker             = r.ticker,
+                    league             = r.league,
+                    away_team          = r.away_team,
+                    home_team          = r.home_team,
+                    leading_team       = r.leading_team,
+                    diff               = r.diff,
+                    period             = r.period,
+                    time_remaining_sec = r.time_remaining_sec,
+                    entry_price        = r.entry_price,
+                    fill_price         = r.fill_price,
+                    contracts          = r.contracts,
+                    cost               = r.cost,
+                    pnl                = round(pnl, 2),
+                )
         except Exception as exc:
             log.debug("Could not check resolution for %s: %s", r.ticker, exc)
 
@@ -655,11 +682,23 @@ def fetch_espn_games(league: LeagueConfig) -> list[GameState]:
 # ---------------------------------------------------------------------------
 
 def is_blowout(g: GameState) -> bool:
+    if g.diff > MAX_SCORE_DIFF:
+        log.warning(
+            "SANITY FAIL %s @ %s: diff=%d exceeds MAX_SCORE_DIFF=%d — likely corrupted ESPN data, skipping",
+            g.away_team, g.home_team, g.diff, MAX_SCORE_DIFF,
+        )
+        return False
+    if g.league.name == "WNBA":
+        diff_thresh = WNBA_BLOWOUT_DIFF
+        time_thresh = WNBA_BLOWOUT_TIME_SEC
+    else:
+        diff_thresh = BLOWOUT_DIFF
+        time_thresh = BLOWOUT_TIME_SEC
     return (
         g.status == "in"
-        and g.diff >= BLOWOUT_DIFF
+        and g.diff >= diff_thresh
         and g.period <= g.league.total_periods          # no overtime
-        and g.time_remaining_sec <= BLOWOUT_TIME_SEC
+        and g.time_remaining_sec <= time_thresh
     )
 
 
@@ -687,18 +726,80 @@ def _kget(endpoint: str, params: dict = {}) -> dict:
     raise RuntimeError(f"Exhausted retries for {endpoint}")
 
 
+_DEAD_STATUSES = {"settled", "finalized", "closed"}
+
+
 def fetch_kalshi_markets(series: str) -> list[dict]:
+    """Fetch all non-settled markets for a series.
+
+    Intentionally omits status=open so we catch markets Kalshi marks as
+    'active' or other in-play variants during live games.
+    """
     markets, cursor = [], None
     while True:
-        params = {"series_ticker": series, "status": "open", "limit": 200}
+        params = {"series_ticker": series, "limit": 200}
         if cursor:
             params["cursor"] = cursor
         data = _kget("/markets", params)
-        markets.extend(data.get("markets") or [])
+        batch = data.get("markets") or []
+        for m in batch:
+            if (m.get("status") or "").lower() not in _DEAD_STATUSES:
+                markets.append(m)
         cursor = data.get("cursor")
         if not cursor:
             break
+    log.debug("fetch_kalshi_markets(%s): %d markets — %s", series, len(markets),
+              [m.get("ticker") for m in markets[:20]])
     return markets
+
+
+def fetch_kalshi_markets_broad(home: str, away: str, date_frag: str) -> list[dict]:
+    """Fallback: search for a specific game matchup when the series-scoped fetch finds nothing.
+
+    Strategy:
+    1. Try constructing the expected event ticker (both team orderings) for KXNBAGAME —
+       fastest path when the market exists in the standard series but wasn't returned
+       because the series fetch doesn't paginate past the first page.
+    2. Broad sweep of up to 200 markets with no series/status filter — catches markets
+       in non-standard series (e.g. Kalshi uses a different prefix for certain playoffs).
+    """
+    h, a = home.upper(), away.upper()
+
+    # 1. Targeted event-ticker lookups (both team orderings)
+    if date_frag:
+        for team_order in (f"{a}{h}", f"{h}{a}"):
+            event_tick = f"KXNBAGAME-{date_frag}{team_order}"
+            try:
+                data = _kget("/markets", {"event_ticker": event_tick})
+                batch = data.get("markets") or []
+                live = [m for m in batch if (m.get("status") or "").lower() not in _DEAD_STATUSES]
+                if live:
+                    log.info("Event-ticker lookup found %d market(s) at %s: %s",
+                             len(live), event_tick, [m["ticker"] for m in live])
+                    return live
+            except Exception as exc:
+                log.debug("Event-ticker lookup failed for %s: %s", event_tick, exc)
+
+    # 2. Broad sweep — no series or status filter, filter client-side by team codes
+    try:
+        data = _kget("/markets", {"limit": 200})
+        batch = data.get("markets") or []
+        matches = [
+            m for m in batch
+            if h in m.get("ticker", "").upper() and a in m.get("ticker", "").upper()
+            and (not date_frag or date_frag in m.get("ticker", "").upper())
+            and (m.get("status") or "").lower() not in _DEAD_STATUSES
+        ]
+        if matches:
+            log.info("Broad sweep found %d market(s) for %s/%s: %s",
+                     len(matches), home, away, [m["ticker"] for m in matches])
+        else:
+            log.warning("Broad sweep found NO markets for %s/%s — market may not exist on Kalshi",
+                        home, away)
+        return matches
+    except Exception as exc:
+        log.debug("Broad market sweep failed: %s", exc)
+        return []
 
 
 def fetch_orderbook_ask(ticker: str) -> tuple[Optional[float], int]:
@@ -819,6 +920,30 @@ def find_winning_ticker(g: GameState, markets: list[dict]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# NBA CDN score cross-check
+# ---------------------------------------------------------------------------
+
+_NBA_CDN_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+
+
+def fetch_nba_cdn_scores() -> dict[tuple[str, str], int]:
+    """Fetch live scores from NBA.com CDN. Returns {(away_tricode, home_tricode): score_diff}."""
+    try:
+        r = requests.get(_NBA_CDN_URL, timeout=8)
+        r.raise_for_status()
+        result = {}
+        for g in r.json()["scoreboard"]["games"]:
+            away = g["awayTeam"]["teamTricode"].upper()
+            home = g["homeTeam"]["teamTricode"].upper()
+            diff = abs(int(g["homeTeam"]["score"]) - int(g["awayTeam"]["score"]))
+            result[(away, home)] = diff
+        return result
+    except Exception as exc:
+        log.warning("NBA CDN fetch failed: %s — proceeding without cross-check", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Order placement (with risk checks)
 # ---------------------------------------------------------------------------
 
@@ -839,6 +964,49 @@ def place_bet(ticker: str, game: GameState, state: AppState) -> bool:
             ticker, ask, MIN_YES_ASK,
         )
         return False
+
+    if ask < MIN_BLOWOUT_ASK:
+        log.warning(
+            "SKIP %s: YES ask $%.4f is below MIN_BLOWOUT_ASK $%.2f — market contradicts our score data, skipping",
+            ticker, ask, MIN_BLOWOUT_ASK,
+        )
+        send_telegram(
+            f"Data/market mismatch — skipped {ticker}\n"
+            f"Our data says blowout but market ask is only ${ask:.2f}\n"
+            f"Check ESPN scores manually."
+        )
+        return False
+
+    if game.league.name == "NBA":
+        cdn = fetch_nba_cdn_scores()
+        cdn_diff = cdn.get((game.away_team, game.home_team))
+        if cdn_diff is not None:
+            if abs(game.diff - cdn_diff) > NBA_CDN_TOLERANCE:
+                log.warning(
+                    "SCORE MISMATCH %s @ %s: ESPN diff=%d vs NBA CDN diff=%d — skipping trade",
+                    game.away_team, game.home_team, game.diff, cdn_diff,
+                )
+                send_telegram(
+                    f"Score mismatch — skipped {ticker}\n"
+                    f"ESPN says {game.leading_team} +{game.diff}pts\n"
+                    f"NBA CDN says diff={cdn_diff}pts\n"
+                    f"Check scores manually."
+                )
+                return False
+            gap = abs(game.diff - cdn_diff)
+            log.info("NBA CDN cross-check OK: ESPN diff=%d, CDN diff=%d", game.diff, cdn_diff)
+            if gap > 0:
+                send_telegram(
+                    f"Scores confirmed (with difference) — {ticker}\n"
+                    f"ESPN: {game.leading_team} +{game.diff}pts\n"
+                    f"NBA CDN: diff={cdn_diff}pts\n"
+                    f"Gap of {gap}pt — within tolerance, proceeding."
+                )
+        else:
+            log.warning(
+                "NBA CDN: no matching game for %s @ %s — proceeding without cross-check",
+                game.away_team, game.home_team,
+            )
 
     if ask_size < MIN_LIQUIDITY:
         log.warning("SKIP %s: liquidity too low (ask_size=%d, need %d)", ticker, ask_size, MIN_LIQUIDITY)
@@ -1230,7 +1398,9 @@ def monitor() -> None:
                             continue
 
                         # Speed up polling once a game is within 5 pts of the threshold
-                        if g.diff >= NEAR_BLOWOUT_DIFF and g.time_remaining_sec <= BLOWOUT_TIME_SEC + 600:
+                        _near_diff = WNBA_NEAR_BLOWOUT_DIFF if g.league.name == "WNBA" else NEAR_BLOWOUT_DIFF
+                        _near_time = WNBA_BLOWOUT_TIME_SEC if g.league.name == "WNBA" else BLOWOUT_TIME_SEC
+                        if g.diff >= _near_diff and g.time_remaining_sec <= _near_time + 600:
                             near_blowout = True
 
                         if not is_blowout(g):
@@ -1255,6 +1425,12 @@ def monitor() -> None:
                             state.blowout_notified.append(g.espn_id)
 
                         ticker = find_winning_ticker(g, kalshi_markets.get(league.name, []))
+                        if ticker is None:
+                            # Fallback: search broadly across all Kalshi series
+                            date_frag = _kalshi_date_str(g.game_date)
+                            fallback = fetch_kalshi_markets_broad(g.home_team, g.away_team, date_frag)
+                            if fallback:
+                                ticker = find_winning_ticker(g, fallback)
                         if ticker is None:
                             log.warning(
                                 "BLOWOUT %s @ %s — NOT BOUGHT: no Kalshi market matched (will retry next poll)",

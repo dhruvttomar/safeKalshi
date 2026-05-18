@@ -190,6 +190,85 @@ if g2.time_remaining_sec == expected_time:
 else:
     fail("time_remaining_sec NCAA Women mid-Q3", f"got {g2.time_remaining_sec}, expected {expected_time}")
 
+# ── WNBA-specific thresholds ─────────────────────────────────────────────────
+section("5b. WNBA BLOWOUT THRESHOLDS")
+
+wnba = bm.LEAGUES[1]  # WNBA — 4 quarters, 600s each
+
+def make_wnba_game(diff, period, clock_sec, status="in", home_score=None, away_score=None):
+    hs = home_score if home_score is not None else diff
+    aws = away_score if away_score is not None else 0
+    return bm.GameState(
+        espn_id="test-wnba", league=wnba,
+        home_team="NYL", away_team="LAS",
+        home_score=hs, away_score=aws,
+        period=period, clock_sec=clock_sec, status=status,
+    )
+
+# Should trigger — 20pt lead, Q4, 18min left = 1080s  (Q4 has 600s, so 18min means clock_sec=480 in Q3 → total=480+600=1080)
+g = make_wnba_game(20, 3, 480)  # 8min left in Q3 + 1 full Q4 (600s) = 1080s
+if bm.is_blowout(g):
+    ok("WNBA 20pt lead Q3 480s → blowout (1080s remaining)", f"time_remaining={g.time_remaining_sec}s")
+else:
+    fail("WNBA 20pt lead Q3 480s → blowout", f"time_remaining={g.time_remaining_sec}s")
+
+# Should NOT trigger — only 19pt lead
+g = make_wnba_game(19, 3, 480)
+if not bm.is_blowout(g):
+    ok("WNBA 19pt lead → not blowout (below 20pt threshold)")
+else:
+    fail("WNBA 19pt lead → not blowout")
+
+# Should NOT trigger — too much time left (>1080s)
+g = make_wnba_game(20, 2, 600)  # Full Q3+Q4 remaining = 1200s > 1080s
+if not bm.is_blowout(g):
+    ok("WNBA 20pt Q2 full quarter → not blowout (too much time)", f"time_remaining={g.time_remaining_sec}s")
+else:
+    fail("WNBA 20pt Q2 full quarter → not blowout", f"time_remaining={g.time_remaining_sec}s")
+
+# WNBA should NOT use NBA thresholds — 22pt lead should still work (>20)
+g = make_wnba_game(22, 3, 480)
+if bm.is_blowout(g):
+    ok("WNBA 22pt lead still triggers (above WNBA 20pt threshold)")
+else:
+    fail("WNBA 22pt lead still triggers")
+
+# NBA 20pt lead should NOT trigger (NBA threshold is 22)
+g_nba = make_game(20, 4, 600)
+if not bm.is_blowout(g_nba):
+    ok("NBA 20pt lead → not blowout (NBA threshold is 22, not 20)")
+else:
+    fail("NBA 20pt lead → not blowout (should require 22 for NBA)")
+
+# ── MAX_SCORE_DIFF sanity cap ─────────────────────────────────────────────────
+section("5c. MAX_SCORE_DIFF SANITY CAP")
+
+# Corrupted data — diff above 33 → always False
+g = make_game(34, 4, 600)
+if not bm.is_blowout(g):
+    ok("diff=34 > MAX_SCORE_DIFF=33 → blocked as corrupted data")
+else:
+    fail("diff=34 > MAX_SCORE_DIFF=33 → should be blocked")
+
+g = make_game(33, 4, 600)
+if bm.is_blowout(g):
+    ok("diff=33 exactly at cap → allowed through")
+else:
+    fail("diff=33 exactly at cap → should be allowed", f"time_remaining={g.time_remaining_sec}s")
+
+# Impossible differentials that caused the bad trades
+g = make_game(61, 4, 300)
+if not bm.is_blowout(g):
+    ok("diff=61 (like bad BOS trade) → blocked by sanity cap")
+else:
+    fail("diff=61 → should be blocked")
+
+g = make_game(89, 4, 300)
+if not bm.is_blowout(g):
+    ok("diff=89 (like bad DET trade) → blocked by sanity cap")
+else:
+    fail("diff=89 → should be blocked")
+
 # ── check_risk ────────────────────────────────────────────────────────────────
 section("6. RISK GATES")
 
@@ -297,6 +376,17 @@ if ticker3 is None:
 else:
     fail("find_winning_ticker returns None when no match", f"got {ticker3!r}")
 
+# ── NBA CDN cross-check ───────────────────────────────────────────────────────
+section("8b. NBA CDN SCORE CROSS-CHECK")
+
+cdn = bm.fetch_nba_cdn_scores()
+if cdn:
+    ok("NBA CDN fetch returned data", f"{len(cdn)} game(s)")
+    for (away, home), diff in list(cdn.items())[:3]:
+        print(f"         {away} @ {home}  diff={diff}")
+else:
+    print(f"  {YELLOW}SKIP{RESET}  NBA CDN — no games live right now (or fetch failed)")
+
 # ── ESPN live fetch ───────────────────────────────────────────────────────────
 section("9. ESPN LIVE SCOREBOARD")
 
@@ -357,18 +447,26 @@ live_game_found = False
 for league in bm.LEAGUES:
     games = bm.fetch_espn_games(league)
     markets = all_kalshi_markets.get(league.name, [])
-    if not markets:
-        continue
     for g in games:
         if g.status != "in":
             continue
-        ticker = bm.find_winning_ticker(g, markets)
         live_game_found = True
+        date_frag = bm._kalshi_date_str(g.game_date)
+        ticker = bm.find_winning_ticker(g, markets)
         if ticker:
             ok(f"Live match: {g.away_team}@{g.home_team} ({league.name})", f"→ {ticker}")
         else:
-            fail(f"Live match: {g.away_team}@{g.home_team} ({league.name})",
-                 "no Kalshi market found — check ESPN abbrev vs Kalshi ticker")
+            # Series-scoped search missed — try broad fallback (mirrors what the main loop does)
+            fallback = bm.fetch_kalshi_markets_broad(g.home_team, g.away_team, date_frag)
+            ticker_fb = bm.find_winning_ticker(g, fallback) if fallback else None
+            if ticker_fb:
+                ok(f"Live match via fallback: {g.away_team}@{g.home_team} ({league.name})",
+                   f"→ {ticker_fb}")
+            else:
+                # Not a hard failure — Kalshi may not have created a market for this game,
+                # or the market was already settled mid-game (valid no-trade case).
+                print(f"  {YELLOW}WARN{RESET}  Live match: {g.away_team}@{g.home_team} ({league.name})"
+                      f" — no Kalshi market found (game may lack a market or market already settled)")
         break
     if live_game_found:
         break
